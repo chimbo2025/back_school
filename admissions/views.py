@@ -7,7 +7,7 @@ from django_filters.rest_framework import DjangoFilterBackend
 from django.contrib.auth import get_user_model
 from .models import Grade, FeeGroup, FeeItem, Student, Payment
 from .serializers import (
-    GradeSerializer, GradeListSerializer, FeeGroupSerializer,
+    GradeSerializer, GradeListSerializer, GradeWriteSerializer, FeeGroupSerializer,
     FeeItemSerializer, StudentListSerializer, StudentDetailSerializer,
     StudentCreateSerializer, PaymentSerializer, FinanceSummarySerializer
 )
@@ -38,7 +38,7 @@ class FeeGroupViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = FeeGroupSerializer
 
 
-class GradeViewSet(viewsets.ReadOnlyModelViewSet):
+class GradeViewSet(viewsets.ModelViewSet):
     queryset = Grade.objects.prefetch_related('fee_groups__items').all()
     filter_backends = [filters.OrderingFilter]
     ordering_fields = ['name']
@@ -47,7 +47,15 @@ class GradeViewSet(viewsets.ReadOnlyModelViewSet):
     def get_serializer_class(self):
         if self.action == 'list':
             return GradeListSerializer
+        elif self.action in ['create', 'update', 'partial_update']:
+            return GradeWriteSerializer
         return GradeSerializer
+
+    def get_permissions(self):
+        # Allow public access for viewing grades (list, retrieve)
+        if self.action in ['list', 'retrieve']:
+            return []
+        return [IsAuthenticated()]
 
 
 class StudentViewSet(viewsets.ModelViewSet):
@@ -64,6 +72,12 @@ class StudentViewSet(viewsets.ModelViewSet):
         elif self.action == 'create':
             return StudentCreateSerializer
         return StudentDetailSerializer
+
+    def get_permissions(self):
+        # Allow public access for student registration (create)
+        if self.action == 'create':
+            return []
+        return [IsAuthenticated()]
 
     @action(detail=False, methods=['get'])
     def stats(self, request):

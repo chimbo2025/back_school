@@ -1,7 +1,7 @@
 from django.core.management.base import BaseCommand
-from admissions.models import Grade, FeeGroup, FeeItem, Student, Payment
+from admissions.models import Grade, FeeGroup, FeeItem, Student, Payment, PaymentClaim
 from decimal import Decimal
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 
 class Command(BaseCommand):
@@ -362,6 +362,31 @@ class Command(BaseCommand):
                 'notes': 'Transfer student from Dar es Salaam branch.',
                 'status': 'Admitted',
             },
+            {
+                # Sibling of stu-1 (same parent: Bi Mwanaisha Ali) — scenario 9
+                # in the gap report: two children of the same parent.
+                'id': 'stu-13',
+                'application_no': 'BFS-2026-1013',
+                'first_name': 'Ibrahim',
+                'middle_name': 'Hassan',
+                'last_name': 'Juma',
+                'gender': 'Male',
+                'dob': '2016-09-08',
+                'address': 'Mwanakwerekwe, Zanzibar',
+                'parent_name': 'Bi Mwanaisha Ali',
+                'parent_phone': '0777123456',
+                'parent_address': 'Mwanakwerekwe Plot 42, Zanzibar',
+                'parent_relationship': 'Mother',
+                'parent_national_id': '1975123456789',
+                'emergency_contact_name': 'Hassan Ali',
+                'emergency_contact_phone': '0777111222',
+                'emergency_contact_relationship': 'Father',
+                'grade_id': 'grade-2',
+                'academic_year': '2026/2027',
+                'previous_school': 'Al-Hikma Nursery',
+                'notes': 'Younger brother of Amina (stu-1).',
+                'status': 'Admitted',
+            },
         ]
 
         students = {}
@@ -409,5 +434,48 @@ class Command(BaseCommand):
             )
             if created:
                 self.stdout.write(f'Created Payment: {payment.reference} for {student.full_name}')
+
+        # Sample payment claims — designed to pair with sample_statement.csv:
+        # claim-1/2/7 exact-match rows, claim-3 phone mismatch, claim-4 amount
+        # mismatch, claim-5 has no transaction ID, claim-6 has no statement row
+        # (goes NOT_FOUND after the scan).
+        claims_data = [
+            {'id': 'claim-1', 'student_id': 'stu-1', 'amount': Decimal('250000'),
+             'transaction_id': 'MP260215101', 'payment_date': '2026-02-15',
+             'payer_phone': '0777123456', 'method': 'M-Pesa', 'notes': 'School fee part payment'},
+            {'id': 'claim-2', 'student_id': 'stu-13', 'amount': Decimal('600000'),
+             'transaction_id': 'MP260215102', 'payment_date': '2026-02-15',
+             'payer_phone': '0777123456', 'method': 'M-Pesa', 'notes': 'Transport fee — paid by same parent'},
+            {'id': 'claim-3', 'student_id': 'stu-2', 'amount': Decimal('400000'),
+             'transaction_id': 'MP260215103', 'payment_date': '2026-02-15',
+             'payer_phone': '0682987654', 'method': 'M-Pesa', 'notes': 'Tuition instalment'},
+            {'id': 'claim-4', 'student_id': 'stu-3', 'amount': Decimal('300000'),
+             'transaction_id': 'MP260215104', 'payment_date': '2026-02-16',
+             'payer_phone': '0778407818', 'method': 'Mixx by Yas', 'notes': 'Lab fee + part tuition'},
+            {'id': 'claim-5', 'student_id': 'stu-4', 'amount': Decimal('150000'),
+             'transaction_id': '', 'payment_date': '2026-02-16',
+             'payer_phone': '0773554433', 'method': 'M-Pesa', 'notes': 'Forgot to capture the transaction ID'},
+            {'id': 'claim-6', 'student_id': 'stu-5', 'amount': Decimal('500000'),
+             'transaction_id': 'MP260215999', 'payment_date': '2026-02-14',
+             'payer_phone': '0754889900', 'method': 'M-Pesa', 'notes': 'Suspected wrong till — no matching row'},
+            {'id': 'claim-7', 'student_id': 'stu-9', 'amount': Decimal('100000'),
+             'transaction_id': 'MP260215105', 'payment_date': '2026-02-16',
+             'payer_phone': '0772334455', 'method': 'M-Pesa', 'notes': 'Exam fee'},
+        ]
+
+        for claim_data in claims_data:
+            student_id = claim_data.pop('student_id')
+            student = students[student_id]
+            claim, created = PaymentClaim.objects.get_or_create(
+                id=claim_data['id'],
+                defaults={**claim_data, 'student': student}
+            )
+            if created:
+                self.stdout.write(f'Created Claim: {claim.id} for {student.full_name}')
+
+        # Age claim-6 so the NOT_FOUND scan (default 3 days) picks it up.
+        PaymentClaim.objects.filter(id='claim-6').update(
+            submitted_at=datetime.now(timezone.utc) - timedelta(days=5)
+        )
 
         self.stdout.write(self.style.SUCCESS('Successfully seeded all data!'))
