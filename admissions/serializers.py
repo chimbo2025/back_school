@@ -1,4 +1,5 @@
 import time
+from django.db import transaction
 from rest_framework import serializers
 from .models import (
     Grade, FeeGroup, FeeItem, Student, Payment, PaymentClaim,
@@ -14,6 +15,12 @@ class FeeItemSerializer(serializers.ModelSerializer):
 
 
 class FeeItemWriteSerializer(serializers.ModelSerializer):
+    # The client sends back the existing string PK when editing. A plain
+    # ModelSerializer treats it as a new unique value and rejects the update
+    # with "fee item with this id already exists", so uniqueness is disabled
+    # here — the PK is an identity, not a value being changed.
+    id = serializers.CharField(required=False, validators=[])
+
     class Meta:
         model = FeeItem
         fields = ['id', 'label', 'amount']
@@ -28,6 +35,7 @@ class FeeGroupSerializer(serializers.ModelSerializer):
 
 
 class FeeGroupWriteSerializer(serializers.ModelSerializer):
+    id = serializers.CharField(required=False, validators=[])
     items = FeeItemWriteSerializer(many=True)
 
     class Meta:
@@ -39,13 +47,11 @@ class FeeGroupWriteSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         items_data = validated_data.pop('items')
+        validated_data.setdefault('id', new_id('fg'))
         fee_group = FeeGroup.objects.create(**validated_data)
         for item_data in items_data:
-            item_id = item_data.pop('id', None)
-            if item_id:
-                item, _ = FeeItem.objects.update_or_create(id=item_id, defaults=item_data)
-            else:
-                item = FeeItem.objects.create(**item_data)
+            item_id = item_data.pop('id', None) or new_id('item')
+            item, _ = FeeItem.objects.update_or_create(id=item_id, defaults=item_data)
             fee_group.items.add(item)
         return fee_group
 
@@ -59,13 +65,9 @@ class FeeGroupWriteSerializer(serializers.ModelSerializer):
         new_item_ids = set()
 
         for item_data in items_data:
-            item_id = item_data.get('id')
-            if item_id:
-                item, _ = FeeItem.objects.update_or_create(id=item_id, defaults=item_data)
-                new_item_ids.add(item.id)
-            else:
-                item = FeeItem.objects.create(**item_data)
-                new_item_ids.add(item.id)
+            item_id = item_data.pop('id', None) or new_id('item')
+            item, _ = FeeItem.objects.update_or_create(id=item_id, defaults=item_data)
+            new_item_ids.add(item.id)
             instance.items.add(item)
 
         # Remove items not in the update
@@ -89,11 +91,15 @@ class GradeSerializer(serializers.ModelSerializer):
 
 
 class GradeListSerializer(serializers.ModelSerializer):
+    # The admin console builds its fee structures from the list endpoint (there
+    # is no per-grade detail fetch), so the nested groups/items must be included
+    # here as well.
+    fee_groups = FeeGroupSerializer(many=True, read_only=True)
     total_fee = serializers.SerializerMethodField()
 
     class Meta:
         model = Grade
-        fields = ['id', 'name', 'description', 'age_range', 'total_fee']
+        fields = ['id', 'name', 'description', 'age_range', 'fee_groups', 'total_fee']
 
     def get_total_fee(self, obj):
         return float(obj.get_total_fee())
@@ -248,6 +254,7 @@ class GradeWriteSerializer(serializers.ModelSerializer):
             grade.fee_groups.add(fee_group)
         return grade
 
+    @transaction.atomic
     def update(self, instance, validated_data):
         fee_groups_data = validated_data.pop('fee_groups', [])
         instance.name = validated_data.get('name', instance.name)
@@ -270,13 +277,9 @@ class GradeWriteSerializer(serializers.ModelSerializer):
                 new_item_ids = set()
 
                 for item_data in items_data:
-                    item_id = item_data.get('id')
-                    if item_id:
-                        item, _ = FeeItem.objects.update_or_create(id=item_id, defaults=item_data)
-                        new_item_ids.add(item.id)
-                    else:
-                        item = FeeItem.objects.create(**item_data)
-                        new_item_ids.add(item.id)
+                    item_id = item_data.pop('id', None) or new_id('item')
+                    item, _ = FeeItem.objects.update_or_create(id=item_id, defaults=item_data)
+                    new_item_ids.add(item.id)
                     fee_group.items.add(item)
 
                 # Remove items not in the update
@@ -284,11 +287,14 @@ class GradeWriteSerializer(serializers.ModelSerializer):
                 if to_remove:
                     fee_group.items.remove(*to_remove)
             else:
-                fee_group = FeeGroup.objects.create(name=fg_data.get('name', 'NEW FEE GROUP'))
+                fee_group = FeeGroup.objects.create(
+                    id=new_id('fg'), name=fg_data.get('name', 'NEW FEE GROUP')
+                )
                 new_fg_ids.add(fee_group.id)
                 items_data = fg_data.get('items', [])
                 for item_data in items_data:
-                    item = FeeItem.objects.create(**item_data)
+                    item_id = item_data.pop('id', None) or new_id('item')
+                    item, _ = FeeItem.objects.update_or_create(id=item_id, defaults=item_data)
                     fee_group.items.add(item)
             instance.fee_groups.add(fee_group)
 

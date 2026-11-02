@@ -8,10 +8,14 @@ __pycache__/
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
+db.sqlite3-wal
+db.sqlite3-shm
 media/
 staticfiles/
 
 # Environment
+.venv/
+venv/
 .env
 .env.local
 .env.*.local
