@@ -1,7 +1,25 @@
 from django.core.management.base import BaseCommand
-from admissions.models import Grade, FeeGroup, FeeItem, Student, Payment, PaymentClaim
+from django.utils import timezone as django_timezone
+from admissions.models import (
+    Grade, FeeGroup, FeeItem, Student, Payment, PaymentClaim, Receipt, Credit,
+)
 from decimal import Decimal
-from datetime import date, datetime, timedelta, timezone
+from datetime import timedelta
+
+
+def build_receipt_snapshot(payment):
+    student = payment.student
+    return {
+        'student_no': student.application_no,
+        'student_name': student.full_name,
+        'grade': student.grade.name,
+        'amount': str(payment.amount),
+        'transaction_id': payment.reference,
+        'payment_date': payment.date.isoformat(),
+        'method': payment.method,
+        'notes': payment.notes or '',
+        'allocations': [],
+    }
 
 
 class Command(BaseCommand):
@@ -422,13 +440,13 @@ class Command(BaseCommand):
             {'id': 'pay-17', 'student_id': 'stu-9', 'amount': Decimal('650000'), 'method': 'Bank', 'date': '2026-02-03', 'reference': 'NMB-993821', 'notes': 'Transport Fee Full'},
             {'id': 'pay-18', 'student_id': 'stu-11', 'amount': Decimal('2000000'), 'method': 'Bank', 'date': '2026-02-08', 'reference': 'CRDB-556102', 'notes': 'Single Lump Sum Payment for Full Academic Year'},
             {'id': 'pay-19', 'student_id': 'stu-12', 'amount': Decimal('150000'), 'method': 'Mixx by Yas', 'date': '2026-02-10', 'reference': 'MX260210419', 'notes': 'Admission Fee'},
-            {'id': 'pay-20', 'student_id': 'stu-12', 'amount': Decimal('2050000'), 'method': 'Bank', 'date': '2026-02-11', 'reference': 'PBZ-889912', 'notes': 'Full Tuition + Transport + Lab Package'},
+            {'id': 'pay-20', 'student_id': 'stu-12', 'amount': Decimal('2100000'), 'method': 'Bank', 'date': '2026-02-11', 'reference': 'PBZ-889912', 'notes': 'Full package plus 50,000 credit carried forward'},
         ]
 
         for payment_data in payments_data:
             student_id = payment_data.pop('student_id')
             student = students[student_id]
-            payment, created = Payment.objects.get_or_create(
+            payment, created = Payment.objects.update_or_create(
                 id=payment_data['id'],
                 defaults={**payment_data, 'student': student}
             )
@@ -442,16 +460,30 @@ class Command(BaseCommand):
         claims_data = [
             {'id': 'claim-1', 'student_id': 'stu-1', 'amount': Decimal('250000'),
              'transaction_id': 'MP260215101', 'payment_date': '2026-02-15',
-             'payer_phone': '0777123456', 'method': 'M-Pesa', 'notes': 'School fee part payment'},
+             'payer_phone': '0777123456', 'method': 'M-Pesa', 'notes': 'School fee part payment',
+             'requested_allocations': [
+                 {'fee_line_id': 'fg-1::item-1-1', 'fee_group_name': 'SCHOOL FEE',
+                  'fee_item_label': 'Tuition & Learning Materials', 'amount': 250000},
+             ]},
             {'id': 'claim-2', 'student_id': 'stu-13', 'amount': Decimal('600000'),
              'transaction_id': 'MP260215102', 'payment_date': '2026-02-15',
-             'payer_phone': '0777123456', 'method': 'M-Pesa', 'notes': 'Transport fee — paid by same parent'},
+             'payer_phone': '0777123456', 'method': 'M-Pesa', 'notes': 'Transport fee — paid by same parent',
+             'requested_allocations': [
+                 {'fee_line_id': 'fg-2-1::item-2-1', 'fee_group_name': 'SCHOOL FEE',
+                  'fee_item_label': 'Tuition & Digital Learning Lab', 'amount': 200000},
+                 {'fee_line_id': 'fg-2-2::item-2-2', 'fee_group_name': 'TRANSPORT FEE',
+                  'fee_item_label': 'School Bus Service (Annual)', 'amount': 400000},
+             ]},
             {'id': 'claim-3', 'student_id': 'stu-2', 'amount': Decimal('400000'),
              'transaction_id': 'MP260215103', 'payment_date': '2026-02-15',
              'payer_phone': '0682987654', 'method': 'M-Pesa', 'notes': 'Tuition instalment'},
-            {'id': 'claim-4', 'student_id': 'stu-3', 'amount': Decimal('300000'),
+            {'id': 'claim-4', 'student_id': 'stu-3', 'amount': Decimal('250000'),
              'transaction_id': 'MP260215104', 'payment_date': '2026-02-16',
-             'payer_phone': '0778407818', 'method': 'Mixx by Yas', 'notes': 'Lab fee + part tuition'},
+             'payer_phone': '0778407818', 'method': 'Mixx by Yas', 'notes': 'Lab fee + part tuition',
+             'requested_allocations': [
+                 {'fee_line_id': 'fg-3-1::item-3-1', 'fee_group_name': 'SCHOOL FEE',
+                  'fee_item_label': 'Tuition & Standard Academic Package', 'amount': 250000},
+             ]},
             {'id': 'claim-5', 'student_id': 'stu-4', 'amount': Decimal('150000'),
              'transaction_id': '', 'payment_date': '2026-02-16',
              'payer_phone': '0773554433', 'method': 'M-Pesa', 'notes': 'Forgot to capture the transaction ID'},
@@ -466,16 +498,67 @@ class Command(BaseCommand):
         for claim_data in claims_data:
             student_id = claim_data.pop('student_id')
             student = students[student_id]
-            claim, created = PaymentClaim.objects.get_or_create(
+            claim, created = PaymentClaim.objects.update_or_create(
                 id=claim_data['id'],
-                defaults={**claim_data, 'student': student}
+                defaults={
+                    **claim_data,
+                    'student': student,
+                    # Seed runs are repeatable demos: reset the fixed sample
+                    # claims to their starting state before the CSV import.
+                    'status': 'PENDING',
+                    'match_reason': '',
+                    'reviewed_at': None,
+                    'reviewed_by': '',
+                    'rejection_reason': '',
+                    'statement_amount': None,
+                    'variance': None,
+                }
             )
             if created:
                 self.stdout.write(f'Created Claim: {claim.id} for {student.full_name}')
 
         # Age claim-6 so the NOT_FOUND scan (default 3 days) picks it up.
+        PaymentClaim.objects.exclude(id='claim-6').update(submitted_at=django_timezone.now())
         PaymentClaim.objects.filter(id='claim-6').update(
-            submitted_at=datetime.now(timezone.utc) - timedelta(days=5)
+            submitted_at=django_timezone.now() - timedelta(days=5)
         )
+
+        # Receipts for demo payments, so the parent status page has something
+        # to open immediately after seeding.
+        for payment in Payment.objects.select_related('student__grade').all():
+            Receipt.objects.get_or_create(
+                payment=payment,
+                defaults={
+                    'id': f'receipt-{payment.id}',
+                    'receipt_no': f'RCPT-{payment.id}',
+                    'student': payment.student,
+                    'snapshot': build_receipt_snapshot(payment),
+                    'issued_by': 'seed_data',
+                },
+            )
+
+        # Persist a demo overpayment credit (stu-12 paid 50,000 above the
+        # grade total) so the admin UI can exercise reallocation/credit.
+        for student in Student.objects.select_related('grade').all():
+            total_fees = student.grade.get_total_fee()
+            total_paid = sum(
+                (p.amount for p in Payment.objects.filter(student=student)),
+                Decimal('0'),
+            )
+            overpaid = total_paid - total_fees
+            if overpaid <= 0:
+                continue
+            latest = Payment.objects.filter(student=student).order_by('-date', '-created_at').first()
+            Credit.objects.get_or_create(
+                id=f'credit-{student.id}',
+                defaults={
+                    'student': student,
+                    'payment': latest,
+                    'amount': overpaid,
+                    'remaining_amount': overpaid,
+                    'reason': 'Overpayment carried forward (seed demo).',
+                    'created_by': 'seed_data',
+                },
+            )
 
         self.stdout.write(self.style.SUCCESS('Successfully seeded all data!'))

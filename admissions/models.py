@@ -1,6 +1,8 @@
 from django.db import models
 from django.core.validators import MinValueValidator
 
+from .normalization import normalize_phone
+
 
 class FeeItem(models.Model):
     id = models.CharField(max_length=50, primary_key=True)
@@ -79,6 +81,9 @@ class Student(models.Model):
     address = models.TextField()
     parent_name = models.CharField(max_length=200)
     parent_phone = models.CharField(max_length=20)
+    # Canonical 0XXXXXXXXX form used by matching. ``parent_phone`` keeps the
+    # number exactly as the parent typed it so printed letters are unchanged.
+    parent_phone_normalized = models.CharField(max_length=20, blank=True, default='', db_index=True)
     parent_address = models.TextField()
     parent_relationship = models.CharField(max_length=20, choices=RELATIONSHIP_CHOICES, default='Father')
     parent_national_id = models.CharField(max_length=50, blank=True, default='')
@@ -97,6 +102,11 @@ class Student(models.Model):
     class Meta:
         db_table = 'students'
         ordering = ['-created_at']
+
+    def save(self, *args, **kwargs):
+        self.parent_phone = (self.parent_phone or '').strip()
+        self.parent_phone_normalized = normalize_phone(self.parent_phone)
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return f"{self.application_no} - {self.first_name} {self.last_name}"
@@ -117,6 +127,9 @@ class Student(models.Model):
 
     def get_outstanding(self):
         return self.get_expected_fees() - self.get_total_paid()
+
+    def get_available_credit(self):
+        return self.credits.aggregate(total=models.Sum('remaining_amount'))['total'] or 0
 
 
 class Payment(models.Model):
@@ -144,6 +157,12 @@ class Payment(models.Model):
     statement_row = models.ForeignKey(
         'StatementRow', on_delete=models.SET_NULL, null=True, blank=True, related_name='payments'
     )
+    # Provider-ready fields: a future callback can create a Payment with
+    # source=PROVIDER, external_id for idempotency and the raw payload for
+    # later reconciliation. Allocation logic only ever sees student + amount.
+    provider = models.CharField(max_length=50, blank=True, default='')
+    external_id = models.CharField(max_length=100, null=True, blank=True, unique=True)
+    raw_payload = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -158,7 +177,7 @@ class PaymentClaim(models.Model):
     STATUS_CHOICES = [
         ('PENDING', 'Pending'),
         ('NEEDS_REVIEW', 'Needs review'),
-        ('APPROVED', 'Approved'),
+        ('CONFIRMED', 'Confirmed'),
         ('REJECTED', 'Rejected'),
         ('NOT_FOUND', 'Not found'),
     ]
@@ -169,9 +188,20 @@ class PaymentClaim(models.Model):
     transaction_id = models.CharField(max_length=100, blank=True, default='', db_index=True)
     payment_date = models.DateField()
     payer_phone = models.CharField(max_length=20)
+    payer_phone_normalized = models.CharField(max_length=20, blank=True, default='', db_index=True)
     method = models.CharField(max_length=20, blank=True, default='')
     screenshot = models.TextField(blank=True, null=True)
     notes = models.TextField(blank=True, null=True)
+    # The parent's optional request: [{fee_line_id, fee_group_name,
+    # fee_item_label, amount}]. It is a request only; the server applies it
+    # after the statement row is confirmed, capped at the statement amount.
+    requested_allocations = models.JSONField(default=list, blank=True)
+    # Filled in on confirmation. The statement amount always wins; variance is
+    # statement_amount - amount and is shown to the accountant.
+    statement_amount = models.DecimalField(
+        max_digits=15, decimal_places=2, null=True, blank=True
+    )
+    variance = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='PENDING')
     match_reason = models.TextField(blank=True, default='')
     submitted_at = models.DateTimeField(auto_now_add=True)
@@ -185,6 +215,21 @@ class PaymentClaim(models.Model):
     class Meta:
         db_table = 'payment_claims'
         ordering = ['-submitted_at']
+        constraints = [
+            # A rejected claim may be corrected and resubmitted. Every other
+            # status must have a unique non-empty transaction ID.
+            models.UniqueConstraint(
+                fields=['transaction_id'],
+                condition=~models.Q(status='REJECTED') & ~models.Q(transaction_id=''),
+                name='unique_active_claim_txn',
+            )
+        ]
+
+    def save(self, *args, **kwargs):
+        self.transaction_id = (self.transaction_id or '').strip().upper()
+        self.payer_phone = (self.payer_phone or '').strip()
+        self.payer_phone_normalized = normalize_phone(self.payer_phone)
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return f"Claim {self.id} - {self.amount} ({self.status})"
@@ -237,6 +282,7 @@ class StatementRow(models.Model):
     date = models.DateField()
     amount = models.DecimalField(max_digits=15, decimal_places=2, validators=[MinValueValidator(0)])
     sender_phone = models.CharField(max_length=30, blank=True, default='')
+    sender_phone_normalized = models.CharField(max_length=20, blank=True, default='', db_index=True)
     sender_name = models.CharField(max_length=200, blank=True, default='')
     receiver_till = models.CharField(max_length=50, blank=True, default='')
     direction = models.CharField(max_length=5, choices=DIRECTION_CHOICES, default='IN')
@@ -262,11 +308,25 @@ class StatementRow(models.Model):
             )
         ]
 
+    def save(self, *args, **kwargs):
+        self.transaction_id = (self.transaction_id or '').strip().upper()
+        self.sender_phone = (self.sender_phone or '').strip()
+        self.sender_phone_normalized = normalize_phone(self.sender_phone)
+        super().save(*args, **kwargs)
+
     def __str__(self):
         return f"{self.transaction_id} - {self.amount} ({self.status})"
 
 
 class Allocation(models.Model):
+    SOURCE_CHOICES = [
+        ('PRIORITY', 'Admin priority order'),
+        ('SPLIT', 'Parent requested split'),
+        ('REALLOCATION', 'Admin reallocation'),
+        ('CREDIT', 'Credit applied'),
+        ('MANUAL', 'Manual'),
+    ]
+
     id = models.CharField(max_length=60, primary_key=True)
     payment = models.ForeignKey(Payment, on_delete=models.CASCADE, related_name='allocations')
     student = models.ForeignKey(Student, on_delete=models.CASCADE, related_name='allocations')
@@ -274,6 +334,8 @@ class Allocation(models.Model):
     fee_group_name = models.CharField(max_length=100, blank=True, default='')
     fee_item_label = models.CharField(max_length=200, blank=True, default='')
     amount = models.DecimalField(max_digits=15, decimal_places=2, validators=[MinValueValidator(0)])
+    source = models.CharField(max_length=20, choices=SOURCE_CHOICES, default='PRIORITY')
+    reason = models.TextField(blank=True, default='')
     reversed = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     created_by = models.CharField(max_length=100, blank=True, default='system')
@@ -286,6 +348,59 @@ class Allocation(models.Model):
         return f"{self.fee_item_label} - {self.amount}"
 
 
+class Credit(models.Model):
+    """Money received above what the student owed.
+
+    A credit is created when a confirmed statement amount is larger than the
+    outstanding balance. It is persisted so it can be shown on the parent
+    statement and applied later by an admin with a reason.
+    """
+
+    id = models.CharField(max_length=60, primary_key=True)
+    student = models.ForeignKey(Student, on_delete=models.CASCADE, related_name='credits')
+    payment = models.ForeignKey(
+        Payment, on_delete=models.SET_NULL, null=True, blank=True, related_name='credits'
+    )
+    amount = models.DecimalField(max_digits=15, decimal_places=2, validators=[MinValueValidator(0)])
+    remaining_amount = models.DecimalField(
+        max_digits=15, decimal_places=2, validators=[MinValueValidator(0)]
+    )
+    reason = models.TextField(blank=True, default='')
+    created_by = models.CharField(max_length=100, blank=True, default='system')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'credits'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Credit {self.student.application_no} - {self.remaining_amount}/{self.amount}"
+
+
+class Receipt(models.Model):
+    """Snapshot of a confirmed payment for the parent's status page.
+
+    The snapshot keeps the receipt readable even if a grade's fees change
+    later. It is created at confirmation time by the allocation service.
+    """
+
+    id = models.CharField(max_length=60, primary_key=True)
+    receipt_no = models.CharField(max_length=60, unique=True)
+    payment = models.OneToOneField(Payment, on_delete=models.CASCADE, related_name='receipt')
+    student = models.ForeignKey(Student, on_delete=models.CASCADE, related_name='receipts')
+    snapshot = models.JSONField(default=dict, blank=True)
+    issued_by = models.CharField(max_length=100, blank=True, default='system')
+    issued_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'receipts'
+        ordering = ['-issued_at']
+
+    def __str__(self):
+        return f"{self.receipt_no} - {self.student.application_no}"
+
+
 class AuditLog(models.Model):
     ACTION_CHOICES = [
         ('ALLOCATE', 'Allocate'),
@@ -293,9 +408,13 @@ class AuditLog(models.Model):
         ('PAYMENT_CREATE', 'Create payment'),
         ('PAYMENT_DELETE', 'Delete payment'),
         ('CLAIM_SUBMIT', 'Submit claim'),
-        ('CLAIM_APPROVE', 'Approve claim'),
+        ('CLAIM_APPROVE', 'Confirm claim'),
         ('CLAIM_REJECT', 'Reject claim'),
         ('CLAIM_NOT_FOUND', 'Claim not found'),
+        ('PAYMENT_CONFIRM', 'Confirm payment'),
+        ('CREDIT_CREATE', 'Create credit'),
+        ('CREDIT_APPLY', 'Apply credit'),
+        ('RECEIPT_ISSUE', 'Issue receipt'),
         ('CSV_IMPORT', 'Import statement'),
         ('ROW_ASSIGN', 'Assign statement row'),
         ('MANUAL_ADJUST', 'Manual adjustment'),

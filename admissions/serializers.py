@@ -3,8 +3,11 @@ from django.db import transaction
 from rest_framework import serializers
 from .models import (
     Grade, FeeGroup, FeeItem, Student, Payment, PaymentClaim,
-    StatementImport, StatementRow, Allocation, AuditLog, AppSetting,
+    StatementImport, StatementRow, Allocation, Credit, Receipt, AuditLog, AppSetting,
 )
+from .normalization import is_valid_phone
+from .services.allocation import build_fee_lines, validate_requested_split
+from .services.matching import suggest_students
 from .utils import new_id
 
 
@@ -110,8 +113,11 @@ class PaymentSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Payment
-        fields = ['id', 'student', 'amount', 'method', 'date', 'reference', 'notes', 'source', 'created_at']
-        read_only_fields = ['created_at', 'source']
+        fields = [
+            'id', 'student', 'amount', 'method', 'date', 'reference', 'notes', 'source',
+            'provider', 'external_id', 'created_at',
+        ]
+        read_only_fields = ['created_at', 'source', 'provider', 'external_id']
 
     def validate_reference(self, value):
         qs = Payment.objects.filter(reference=value)
@@ -314,11 +320,16 @@ class PaymentClaimSerializer(serializers.ModelSerializer):
         model = PaymentClaim
         fields = [
             'id', 'student', 'student_name', 'grade_name', 'amount', 'transaction_id',
-            'payment_date', 'payer_phone', 'method', 'screenshot', 'notes', 'status',
+            'payment_date', 'payer_phone', 'payer_phone_normalized', 'method', 'screenshot',
+            'notes', 'requested_allocations', 'statement_amount', 'variance', 'status',
             'match_reason', 'submitted_at', 'reviewed_at', 'reviewed_by',
             'rejection_reason', 'matched_payment',
         ]
-        read_only_fields = ['submitted_at', 'reviewed_at', 'reviewed_by', 'rejection_reason', 'match_reason', 'matched_payment', 'status']
+        read_only_fields = [
+            'submitted_at', 'reviewed_at', 'reviewed_by', 'rejection_reason',
+            'match_reason', 'matched_payment', 'status', 'payer_phone_normalized',
+            'statement_amount', 'variance',
+        ]
 
     def get_student_name(self, obj):
         return obj.student.full_name
@@ -331,24 +342,99 @@ class PaymentClaimSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError('Amount must be greater than zero.')
         return value
 
+    def validate_payer_phone(self, value):
+        if not is_valid_phone(value):
+            raise serializers.ValidationError(
+                'Use a valid Tanzanian phone number, e.g. 0777 123 456.'
+            )
+        return (value or '').strip()
+
+    def validate(self, attrs):
+        instance = self.instance
+        amount = attrs.get('amount', getattr(instance, 'amount', None))
+        student = attrs.get('student', getattr(instance, 'student', None))
+        requested = attrs.get(
+            'requested_allocations',
+            getattr(instance, 'requested_allocations', []) if instance else [],
+        )
+        if requested and student is not None and amount is not None:
+            fee_lines = build_fee_lines(student.grade)
+            errors = validate_requested_split(requested, amount, fee_lines)
+            if errors:
+                raise serializers.ValidationError({'requested_allocations': errors})
+        return attrs
+
     def validate_transaction_id(self, value):
-        return (value or '').strip().upper()
+        value = (value or '').strip().upper()
+        if not value:
+            return value
+        qs = PaymentClaim.objects.filter(transaction_id=value).exclude(status='REJECTED')
+        if self.instance:
+            qs = qs.exclude(pk=self.instance.pk)
+        if qs.exists():
+            raise serializers.ValidationError(
+                f'Transaction ID "{value}" has already been submitted.'
+            )
+        if Payment.objects.filter(reference__iexact=value).exists():
+            raise serializers.ValidationError(
+                f'Transaction ID "{value}" has already been confirmed.'
+            )
+        # An UNCLAIMED row may still be waiting for its parent; it will be
+        # matched automatically. A row that is already matched/assigned means
+        # the money is accounted for, so a new claim would be a duplicate.
+        if StatementRow.objects.filter(
+            transaction_id__iexact=value, status__in=['MATCHED', 'ASSIGNED']
+        ).exists():
+            raise serializers.ValidationError(
+                f'Transaction ID "{value}" has already been matched to a payment.'
+            )
+        return value
 
 
 class StatementRowSerializer(serializers.ModelSerializer):
     claim_status = serializers.CharField(source='claim.status', read_only=True, default=None)
     student_name = serializers.SerializerMethodField()
+    suggested_students = serializers.SerializerMethodField()
 
     class Meta:
         model = StatementRow
         fields = [
             'id', 'import_record', 'transaction_id', 'date', 'amount', 'sender_phone',
-            'sender_name', 'receiver_till', 'direction', 'status', 'claim', 'claim_status',
-            'student', 'student_name', 'match_type', 'match_reason', 'created_at',
+            'sender_phone_normalized', 'sender_name', 'receiver_till', 'direction',
+            'status', 'claim', 'claim_status', 'student', 'student_name', 'match_type',
+            'match_reason', 'suggested_students', 'created_at',
         ]
 
     def get_student_name(self, obj):
         return obj.student.full_name if obj.student else None
+
+    def _suggestion_sources(self):
+        context = self.context
+        if 'suggestion_students' not in context:
+            context['suggestion_students'] = list(
+                Student.objects.select_related('grade').all()
+            )
+        if 'suggestion_claims' not in context:
+            context['suggestion_claims'] = list(PaymentClaim.objects.all())
+        return context['suggestion_students'], context['suggestion_claims']
+
+    def get_suggested_students(self, obj):
+        # Suggestions are only useful for money that has no confirmed owner.
+        if obj.status != 'UNCLAIMED' or not obj.sender_phone_normalized:
+            return []
+        students, claims = self._suggestion_sources()
+        suggestions = suggest_students(obj, students, claims)
+        return [
+            {
+                'id': suggestion.student.id,
+                'application_no': suggestion.student.application_no,
+                'name': suggestion.student.full_name,
+                'grade': suggestion.student.grade.name,
+                'reason': suggestion.reason,
+                'matched_phone': suggestion.matched_phone,
+            }
+            for suggestion in suggestions
+        ]
 
 
 class StatementImportSerializer(serializers.ModelSerializer):
@@ -365,8 +451,38 @@ class AllocationSerializer(serializers.ModelSerializer):
         model = Allocation
         fields = [
             'id', 'payment', 'student', 'fee_line_id', 'fee_group_name',
-            'fee_item_label', 'amount', 'reversed', 'created_at', 'created_by',
+            'fee_item_label', 'amount', 'source', 'reason', 'reversed', 'created_at',
+            'created_by',
         ]
+
+
+class CreditSerializer(serializers.ModelSerializer):
+    student_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Credit
+        fields = [
+            'id', 'student', 'student_name', 'payment', 'amount', 'remaining_amount',
+            'reason', 'created_by', 'created_at', 'updated_at',
+        ]
+
+    def get_student_name(self, obj):
+        return obj.student.full_name if obj.student else None
+
+
+class ReceiptSerializer(serializers.ModelSerializer):
+    student_name = serializers.SerializerMethodField()
+    student_no = serializers.CharField(source='student.application_no', read_only=True)
+
+    class Meta:
+        model = Receipt
+        fields = [
+            'id', 'receipt_no', 'payment', 'student', 'student_no', 'student_name',
+            'snapshot', 'issued_by', 'issued_at',
+        ]
+
+    def get_student_name(self, obj):
+        return obj.student.full_name if obj.student else None
 
 
 class AuditLogSerializer(serializers.ModelSerializer):

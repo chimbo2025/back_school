@@ -103,6 +103,13 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.IsAuthenticated',
     ],
+    'DEFAULT_THROTTLE_RATES': {
+        # Public status lookups: enough for a parent to check a few children,
+        # low enough to make student-number guessing impractical.
+        'public_lookup': '30/min',
+        # Claim submissions from one phone/IP address.
+        'claim_submit': '10/min',
+    },
 }
 
 SIMPLE_JWT = {

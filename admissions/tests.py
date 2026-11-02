@@ -1,4 +1,5 @@
 from django.contrib.auth.models import User
+from django.db import IntegrityError, transaction
 from django.test import TestCase
 from rest_framework.test import APIClient
 
@@ -10,7 +11,9 @@ class GradeFeeGroupUpdateTests(TestCase):
 
     def setUp(self):
         self.client = APIClient()
-        self.client.force_authenticate(User.objects.create_user('admin', password='x'))
+        self.client.force_authenticate(
+            User.objects.create_superuser('admin', password='x')
+        )
 
         self.admission = FeeGroup.objects.create(id='fg-adm', name='ADMISSION FEE')
         self.term = FeeItem.objects.create(id='item-term', label='Tuition', amount=1200000)
@@ -163,3 +166,81 @@ class PublicPaymentFlowTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 401)
+
+
+class Phase2SchemaTests(TestCase):
+    """Model-level guarantees added in Phase 2 Step 1."""
+
+    def setUp(self):
+        self.grade = Grade.objects.create(id='grade-schema', name='Grade 1')
+        self.student = Student.objects.create(
+            id='stu-schema',
+            application_no='BFS-2026-9001',
+            first_name='Amina',
+            last_name='Juma',
+            gender='Female',
+            dob='2015-01-01',
+            address='Zanzibar',
+            parent_name='Bi Mwanaisha Ali',
+            parent_phone='+255 777 123 456',
+            parent_address='Zanzibar',
+            parent_relationship='Mother',
+            grade=self.grade,
+            academic_year='2026',
+        )
+
+    def test_phone_numbers_are_normalised_on_save(self):
+        self.assertEqual(self.student.parent_phone_normalized, '0777123456')
+
+        claim = PaymentClaim.objects.create(
+            id='claim-schema-1',
+            student=self.student,
+            amount=100000,
+            transaction_id=' mp260101001 ',
+            payment_date='2026-01-01',
+            payer_phone='255682987654',
+        )
+        self.assertEqual(claim.transaction_id, 'MP260101001')
+        self.assertEqual(claim.payer_phone_normalized, '0682987654')
+
+    def test_duplicate_active_transaction_id_is_blocked_by_the_database(self):
+        PaymentClaim.objects.create(
+            id='claim-schema-2',
+            student=self.student,
+            amount=100000,
+            transaction_id='MP260101002',
+            payment_date='2026-01-01',
+            payer_phone='0777123456',
+        )
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                PaymentClaim.objects.create(
+                    id='claim-schema-3',
+                    student=self.student,
+                    amount=100000,
+                    transaction_id='MP260101002',
+                    payment_date='2026-01-01',
+                    payer_phone='0777123456',
+                )
+
+    def test_rejected_claim_can_be_corrected_and_resubmitted(self):
+        rejected = PaymentClaim.objects.create(
+            id='claim-schema-4',
+            student=self.student,
+            amount=100000,
+            transaction_id='MP260101003',
+            payment_date='2026-01-01',
+            payer_phone='0777123456',
+            status='REJECTED',
+        )
+        replacement = PaymentClaim.objects.create(
+            id='claim-schema-5',
+            student=self.student,
+            amount=100000,
+            transaction_id='MP260101003',
+            payment_date='2026-01-02',
+            payer_phone='0777123456',
+        )
+        rejected.refresh_from_db()
+        self.assertEqual(rejected.status, 'REJECTED')
+        self.assertEqual(replacement.status, 'PENDING')

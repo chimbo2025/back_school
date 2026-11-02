@@ -1,5 +1,8 @@
 from django.contrib import admin
-from .models import Grade, FeeGroup, FeeItem, Student, Payment
+from .models import (
+    Grade, FeeGroup, FeeItem, Student, Payment, PaymentClaim,
+    StatementRow, Credit, Receipt,
+)
 
 
 class FeeItemInline(admin.TabularInline):
@@ -70,3 +73,30 @@ class PaymentAdmin(admin.ModelAdmin):
     list_filter = ['method', 'date']
     search_fields = ['student__application_no', 'student__first_name', 'student__last_name', 'reference']
     ordering = ['-date']
+
+
+@admin.register(PaymentClaim)
+class PaymentClaimAdmin(admin.ModelAdmin):
+    list_display = ['id', 'student', 'amount', 'statement_amount', 'variance', 'transaction_id', 'status', 'submitted_at']
+    list_filter = ['status', 'method']
+    search_fields = ['id', 'student__application_no', 'transaction_id', 'payer_phone']
+    ordering = ['-submitted_at']
+
+
+@admin.register(StatementRow)
+class StatementRowAdmin(admin.ModelAdmin):
+    list_display = ['transaction_id', 'date', 'amount', 'sender_phone', 'direction', 'status']
+    list_filter = ['status', 'direction']
+    search_fields = ['transaction_id', 'sender_phone', 'sender_name']
+
+
+@admin.register(Credit)
+class CreditAdmin(admin.ModelAdmin):
+    list_display = ['id', 'student', 'amount', 'remaining_amount', 'created_by', 'created_at']
+    search_fields = ['student__application_no', 'student__first_name', 'student__last_name']
+
+
+@admin.register(Receipt)
+class ReceiptAdmin(admin.ModelAdmin):
+    list_display = ['receipt_no', 'student', 'payment', 'issued_by', 'issued_at']
+    search_fields = ['receipt_no', 'student__application_no', 'payment__reference']

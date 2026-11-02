@@ -1,18 +1,92 @@
 from rest_framework import viewsets, status, filters, serializers
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from django.db.models import Sum, Count
 from django_filters.rest_framework import DjangoFilterBackend
 from django.contrib.auth import get_user_model
 from .models import Grade, FeeGroup, FeeItem, Student, Payment
+from .permissions import IsAccountantOrAdmin, IsAdmin
 from .serializers import (
     GradeSerializer, GradeListSerializer, GradeWriteSerializer, FeeGroupSerializer,
     FeeItemSerializer, StudentListSerializer, StudentDetailSerializer,
     StudentCreateSerializer, PaymentSerializer, FinanceSummarySerializer
 )
+from .services.allocation import (
+    AllocationError, DuplicateTransactionError, confirm_payment,
+)
+from .utils import parse_date
 
 User = get_user_model()
+
+
+def _record_manual_payment(request, student, data):
+    """Create an admin-only manual payment through the allocation service.
+
+    Lipa Namba money must be backed by a till statement row, so it cannot be
+    typed in by hand. Bank/cash payments are allowed for an admin, but require
+    a reason and are fully allocated/receipted/audited like any other payment.
+    """
+    method = (data.get('method') or '').strip()
+    if method == 'Lipa Namba':
+        return None, Response(
+            {
+                'error': 'statement_required',
+                'detail': (
+                    'Lipa Namba payments must be confirmed from the till '
+                    'statement or a parent claim, not entered manually.'
+                ),
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    reason = (data.get('notes') or data.get('reason') or '').strip()
+    if not reason:
+        return None, Response(
+            {
+                'error': 'reason_required',
+                'detail': 'A reason is required for a manual payment.',
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    reference = (data.get('reference') or '').strip()
+    if not reference:
+        return None, Response(
+            {'error': 'reference_required', 'detail': 'A transaction ID is required.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        result = confirm_payment(
+            student=student,
+            amount=data.get('amount'),
+            reference=reference,
+            payment_date=parse_date(data.get('date')),
+            method=method or 'Bank',
+            notes=reason,
+            source='MANUAL',
+            performed_by=_actor_from_request(request),
+        )
+    except DuplicateTransactionError as exc:
+        return None, Response(
+            {'error': 'duplicate_transaction', 'detail': str(exc)},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    except AllocationError as exc:
+        return None, Response(
+            {'error': 'allocation_error', 'detail': str(exc)},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    return result.payment, None
+
+
+def _actor_from_request(request, fallback='admin'):
+    user = getattr(request, 'user', None)
+    if user is not None and user.is_authenticated:
+        return user.username or fallback
+    return fallback
+
 
 
 class UserSerializer(serializers.ModelSerializer):
@@ -31,11 +105,13 @@ def me_view(request):
 class FeeItemViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = FeeItem.objects.all()
     serializer_class = FeeItemSerializer
+    permission_classes = [AllowAny]
 
 
 class FeeGroupViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = FeeGroup.objects.prefetch_related('items').all()
     serializer_class = FeeGroupSerializer
+    permission_classes = [AllowAny]
 
 
 class GradeViewSet(viewsets.ModelViewSet):
@@ -52,10 +128,12 @@ class GradeViewSet(viewsets.ModelViewSet):
         return GradeSerializer
 
     def get_permissions(self):
-        # Allow public access for viewing grades (list, retrieve)
+        # Fee structures are public (the parent portal needs them). Editing
+        # fees is an administrator action.
         if self.action in ['list', 'retrieve']:
-            return []
-        return [IsAuthenticated()]
+            return [AllowAny()]
+        return [IsAdmin()]
+
 
 
 class StudentViewSet(viewsets.ModelViewSet):
@@ -74,10 +152,13 @@ class StudentViewSet(viewsets.ModelViewSet):
         return StudentDetailSerializer
 
     def get_permissions(self):
-        # Allow public access for student registration (create)
+        # Public student registration stays open. Staff can browse students;
+        # only an administrator can change status or add money by hand.
         if self.action == 'create':
-            return []
-        return [IsAuthenticated()]
+            return [AllowAny()]
+        if self.action in ['list', 'retrieve', 'stats']:
+            return [IsAccountantOrAdmin()]
+        return [IsAdmin()]
 
     @action(detail=False, methods=['get'])
     def stats(self, request):
@@ -110,12 +191,14 @@ class StudentViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def add_payment(self, request, pk=None):
         student = self.get_object()
-        serializer = PaymentSerializer(data=request.data)
-        if serializer.is_valid():
-            serializer.save(student=student)
-            student.refresh_from_db()
-            return Response(StudentDetailSerializer(student).data, status=status.HTTP_201_CREATED)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        payment, error = _record_manual_payment(request, student, request.data)
+        if error is not None:
+            return error
+        student.refresh_from_db()
+        return Response(
+            StudentDetailSerializer(student).data,
+            status=status.HTTP_201_CREATED,
+        )
 
     @action(detail=True, methods=['patch'])
     def update_status(self, request, pk=None):
@@ -136,8 +219,28 @@ class PaymentViewSet(viewsets.ModelViewSet):
     ordering_fields = ['date', 'amount']
     ordering = ['-date']
 
+    def get_permissions(self):
+        if self.action in ['list', 'retrieve']:
+            return [IsAccountantOrAdmin()]
+        return [IsAdmin()]
+
+    def create(self, request, *args, **kwargs):
+        student = Student.objects.filter(id=request.data.get('student')).first()
+        if student is None:
+            return Response(
+                {'error': 'Student not found.'}, status=status.HTTP_400_BAD_REQUEST
+            )
+        payment, error = _record_manual_payment(request, student, request.data)
+        if error is not None:
+            return error
+        return Response(
+            PaymentSerializer(payment).data, status=status.HTTP_201_CREATED
+        )
+
 
 class FinanceViewSet(viewsets.ViewSet):
+    permission_classes = [IsAccountantOrAdmin]
+
     @action(detail=False, methods=['get'])
     def summary(self, request):
         students = Student.objects.all()
